@@ -9,7 +9,12 @@
 # 不按 GFM 的原因:GFM 在第一个空行就断表,而台账 ③ 在 1751 行处有个存量空行,按 GFM 后面约 800 行(含大家每天追加的新行)
 # 全在表外、判据会对追加位盲;存量不回头清(0927-主R-33),ledger-push 只拦本次改动行,全文模式给主R 看趋势用。
 # 另判一种:本次改动引入的空行落在两行 | 之间(下一个非空行仍是 | 行),GFM 会从这里断表、把后面的行渲染成正文。
+# ③ 通信节没有表头(历史如此,0925 起大家统一写六格 | 日期 | 发→收 | 件号 | 标签 | 事由 | 状态 |),按 SECTION_WIDTH 给定宽度判,
+# 节内偶然长得像表头的行(1126 行后面有人留了一行 |------|)不当表头,否则整节按错宽度判。
 import re, subprocess, sys
+
+# 无表头的节:节标题前缀 -> 该节所有 | 行的固定格数(台账写法.md 三)
+SECTION_WIDTH = {"## ③": 6}
 
 SEP = re.compile(r"\|?[\s:\-|]*-[\s:\-|]*\|?$")
 
@@ -27,6 +32,18 @@ def scan(lines):
     """返回 [(行号1起, 表头列数, 本行列数)] 的列数不一致清单、[行号] 的表内空行清单、表的个数。"""
     bad, blanks, tables, i, n = [], [], 0, 0, len(lines)
     while i < n:
+        fixed = next((w for k, w in SECTION_WIDTH.items() if lines[i].startswith(k)), None)
+        if fixed is not None:
+            tables += 1
+            j = i + 1
+            while j < n and not lines[j].startswith("## "):
+                if lines[j].startswith("|") and not SEP.match(lines[j]):
+                    c = cells(lines[j])
+                    if c != fixed:
+                        bad.append((j + 1, fixed, c))
+                j += 1
+            i = j
+            continue
         if lines[i].startswith("|") and i + 1 < n and lines[i + 1].startswith("|") and SEP.match(lines[i + 1]):
             tables += 1
             width = cells(lines[i])

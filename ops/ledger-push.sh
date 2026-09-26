@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-VALID_GROUPS=("简历Agent组" "模面组" "后端组" "数据组" "部署安全组" "前端组" "法务组" "主R" "审计组")
+VALID_GROUPS=("简历Agent组" "模面组" "后端组" "数据组" "部署安全组" "前端组" "小程序组" "法务组" "主R" "审计组")
 LEDGER_FILE="${LEDGER_FILE:-交付台账.md}"
 
 die() {
@@ -222,13 +222,37 @@ if [[ -n "$(git status --porcelain -u -- "${STASH_PATHS[@]}")" ]]; then
 fi
 
 if ! git fetch origin; then
-  die "git fetch origin 失败"
+  # fetch 失败时台账改动已在 stash 里,不还原就会让调用方看到"工作区干净"
+  # 而误以为丢了改动(0924 实测:一次瞬时 fetch 失败后重跑报"无改动可提交")。
+  msg="git fetch origin 失败"
+  if [[ $STASHED -eq 1 ]]; then
+    if git stash pop -q; then
+      msg="$msg;本地台账改动已还原到工作区,原样重跑即可"
+    else
+      msg="$msg;本地台账改动仍在 git stash list,需手工 stash pop"
+    fi
+  fi
+  die "$msg"
 fi
 
 if ! git pull --rebase origin main; then
+  # 只有真有未合并路径才是冲突;pull 自带的 fetch 失败(网络抖动)也会让它非零退出,
+  # 那种情况把 stash 还原、告诉调用方原样重跑,别报成"冲突"(0924 实测两者被混报)。
+  if [[ -n "$(git ls-files -u)" ]]; then
+    git rebase --abort >/dev/null 2>&1 || true
+    msg="pull --rebase 冲突,已中止,需人工处理(不自动解决)"
+    [[ $STASHED -eq 1 ]] && msg="$msg;本地改动已 stash,见 git stash list"
+    die "$msg"
+  fi
   git rebase --abort >/dev/null 2>&1 || true
-  msg="pull --rebase 冲突,已中止,需人工处理(不自动解决)"
-  [[ $STASHED -eq 1 ]] && msg="$msg;本地改动已 stash,见 git stash list"
+  msg="pull --rebase 失败但无冲突(多半是 fetch 网络失败)"
+  if [[ $STASHED -eq 1 ]]; then
+    if git stash pop -q; then
+      msg="$msg;本地台账改动已还原到工作区,原样重跑即可"
+    else
+      msg="$msg;本地台账改动仍在 git stash list,需手工 stash pop"
+    fi
+  fi
   die "$msg"
 fi
 
@@ -273,6 +297,17 @@ else
 
   rm -f "$CUR_TSV"
   trap - EXIT
+fi
+
+# ---------- d2. 表格行列数(0927-主R-33,起因 0927-后端-06) ----------
+# 只判本次相对 HEAD 新增/改动的行(此时已 rebase 到 origin/main,HEAD 就是别人最新推的),存量 453 行不回头清。
+# 判据与本脚本同目录,找不到直接拒:判据静默缺席比拦错更糟(0926 开关型判据两侧不对称)。
+if [[ $RESUME_PUSH -eq 0 ]]; then
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [[ -f "$SELF_DIR/ledger-table-lint.py" ]] || die "找不到判据 $SELF_DIR/ledger-table-lint.py(应与本脚本同目录;用 ~/btd/main/ops/ledger-push.sh)"
+  if ! python3 "$SELF_DIR/ledger-table-lint.py" "$LEDGER_FILE" --changed HEAD; then
+    die "本次改动的表格行列数与表头不一致或表内插了空行(上面逐行列出);竖线写成 \\| 或改成指针,命令与正则不进表行(台账写法.md 三)"
+  fi
 fi
 
 # ---------- e. commit + push + 验证并入 ----------

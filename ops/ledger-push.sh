@@ -18,6 +18,15 @@ set -euo pipefail
 VALID_GROUPS=("简历Agent组" "模面组" "后端组" "数据组" "部署安全组" "前端组" "小程序组" "法务组" "主R" "审计组")
 LEDGER_FILE="${LEDGER_FILE:-交付台账.md}"
 
+# 0930 副本自检（0930-数据-10 抓出台账仓 ops/ 副本落后主树，0927-小程序-19 是同件第一次）：主树 ops/ 那份是权威，
+#   随 btd-ledger 分发的本份一旦与主树那份内容不同，就改为执行主树那份（lock 与判据按 cwd 仓库根取，不受影响）；
+#   主树不在（别的机器）则照常用本份。判据用 cmp 比内容，不比 mtime；只重执行一次，防两份互指成环。
+BTD_MAIN_LEDGER_PUSH="${BTD_MAIN_LEDGER_PUSH:-$HOME/btd/main/ops/ledger-push.sh}"
+if [[ -z "${BTD_LEDGER_PUSH_NO_REEXEC:-}" && -f "$BTD_MAIN_LEDGER_PUSH" ]] && ! cmp -s "$BTD_MAIN_LEDGER_PUSH" "${BASH_SOURCE[0]}"; then
+  echo "notice: 本份 ledger-push.sh 与主树 $BTD_MAIN_LEDGER_PUSH 内容不同（台账仓 ops/ 副本落后或超前），改为执行主树那份；请主R 同步副本" >&2
+  BTD_LEDGER_PUSH_NO_REEXEC=1 exec bash "$BTD_MAIN_LEDGER_PUSH" "$@"
+fi
+
 die() {
   echo "拒绝:$*" >&2
   exit 1
@@ -203,7 +212,7 @@ fi
 # autostash 回放冲突时并不会让外层命令以非零退出(已实测:冲突标记
 # <<<<<<< 会被就地留在文件里、随后被当成"改动"一起提交推送到
 # origin/main),这正是红线21明令禁止的"自动解决"。改为手工
-# stash → pull --rebase → stash pop,pop 的退出码才诚实反映冲突。
+# stash → pull --rebase → 按 sha stash apply,apply 的退出码才诚实反映冲突。
 # --relock 时锁文件也可能是脏的(新建/改写,还未提交),必须和台账文件一起
 # 暂存,否则接下来的 pull --rebase 会因为锁文件的未提交改动直接报错退出
 # (已实测:relock-only 生成锁文件后紧接着 --relock,若只暂存台账文件,
@@ -213,23 +222,39 @@ if [[ $RELOCK -eq 1 ]]; then
   STASH_PATHS+=("$LOCK_FILE_REL")
 fi
 
+# 还原一律按 sha 指名(apply + drop),不用无参 pop:pop 弹的是栈顶,栈里还留着历次 pop 冲突后
+# 没清的残留(0927-部署-31 报一份 clone 里积了 18 条),栈顶未必是本次那条;tag 带组名+时间+pid,
+# 让 stash list 里能认出是谁的哪一次。各组台账目录是独立 clone,栈不跨组共用,但残留同样会错位。
 STASHED=0
+STASH_SHA=""
 if [[ -n "$(git status --porcelain -u -- "${STASH_PATHS[@]}")" ]]; then
-  if ! git stash push -u -q -m "ledger-push:${STASH_PATHS[*]}" -- "${STASH_PATHS[@]}"; then
+  STASH_TAG="ledger-push:${CUR_NAME}:$(date +%Y%m%dT%H%M%S):$$:${STASH_PATHS[*]}"
+  if ! git stash push -u -q -m "$STASH_TAG" -- "${STASH_PATHS[@]}"; then
     die "本地台账改动暂存失败(git stash push)"
   fi
+  STASH_SHA="$(git stash list --format='%H %gs' | grep -F -- "$STASH_TAG" | head -1 | cut -d' ' -f1 || true)"
+  [[ -n "$STASH_SHA" ]] || die "stash 已 push 但在 git stash list 里找不到本次那条(tag=$STASH_TAG),已中止"
   STASHED=1
 fi
+# 按 sha 还原本次那条;成功即 drop,失败(冲突)保留并返回非零,与 pop 语义一致但不会弹错条目。
+# drop 只认 stash@{n} 不认裸 sha(实测 drop <sha> 报「不是 stash 引用」),所以 apply 成功后再按 sha 反查
+# 当下的 stash@{n} 去 drop;反查失败只留一条残留,不影响提交。
+restore_stash() {
+  git stash apply -q "$STASH_SHA" || return 1
+  local ref
+  ref="$(git stash list --format='%H %gd' | grep -F -- "$STASH_SHA" | head -1 | cut -d' ' -f2 || true)"
+  if [[ -n "$ref" ]]; then git stash drop -q "$ref" || true; fi
+}
 
 if ! git fetch origin; then
   # fetch 失败时台账改动已在 stash 里,不还原就会让调用方看到"工作区干净"
   # 而误以为丢了改动(0924 实测:一次瞬时 fetch 失败后重跑报"无改动可提交")。
   msg="git fetch origin 失败"
   if [[ $STASHED -eq 1 ]]; then
-    if git stash pop -q; then
+    if restore_stash; then
       msg="$msg;本地台账改动已还原到工作区,原样重跑即可"
     else
-      msg="$msg;本地台账改动仍在 git stash list,需手工 stash pop"
+      msg="$msg;本地台账改动仍在 git stash $STASH_SHA,需手工 git stash apply $STASH_SHA"
     fi
   fi
   die "$msg"
@@ -241,24 +266,24 @@ if ! git pull --rebase origin main; then
   if [[ -n "$(git ls-files -u)" ]]; then
     git rebase --abort >/dev/null 2>&1 || true
     msg="pull --rebase 冲突,已中止,需人工处理(不自动解决)"
-    [[ $STASHED -eq 1 ]] && msg="$msg;本地改动已 stash,见 git stash list"
+    [[ $STASHED -eq 1 ]] && msg="$msg;本地改动在 git stash $STASH_SHA"
     die "$msg"
   fi
   git rebase --abort >/dev/null 2>&1 || true
   msg="pull --rebase 失败但无冲突(多半是 fetch 网络失败)"
   if [[ $STASHED -eq 1 ]]; then
-    if git stash pop -q; then
+    if restore_stash; then
       msg="$msg;本地台账改动已还原到工作区,原样重跑即可"
     else
-      msg="$msg;本地台账改动仍在 git stash list,需手工 stash pop"
+      msg="$msg;本地台账改动仍在 git stash $STASH_SHA,需手工 git stash apply $STASH_SHA"
     fi
   fi
   die "$msg"
 fi
 
 if [[ $STASHED -eq 1 ]]; then
-  if ! git stash pop -q; then
-    die "本地台账改动与远端最新版本冲突(stash pop 冲突),已中止且未提交;改动仍保留在 git stash list 中,请手工 git stash pop 解决冲突后重跑(不自动解决)"
+  if ! restore_stash; then
+    die "本地台账改动与远端最新版本冲突(stash apply 冲突),已中止且未提交;改动仍保留在 git stash $STASH_SHA 中(不自动解决)。处置:git checkout HEAD -- $LEDGER_FILE 回到远端最新(裸 checkout -- 在 unmerged 路径上会报错),再重跑你的幂等写入脚本;别无参 git stash pop,栈顶未必是这条"
   fi
 fi
 

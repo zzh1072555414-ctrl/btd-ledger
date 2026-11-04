@@ -15,16 +15,28 @@
 
 set -euo pipefail
 
-VALID_GROUPS=("简历Agent组" "模面组" "后端组" "数据组" "部署安全组" "前端组" "小程序组" "法务组" "主R" "审计组")
+VALID_GROUPS=("简历Agent组" "模面组" "后端组" "数据组" "部署安全组" "前端组" "小程序组" "法务组" "App组" "运营组" "QA验收组" "主R" "审计组")
 LEDGER_FILE="${LEDGER_FILE:-交付台账.md}"
+
+# 版本号:本份比旧版多出一个步骤就 +1(1 = 1105 f 步对象库整理)。副本自检用它判「主树那份是不是更旧」,
+#   格式固定为独占一行的 LEDGER_PUSH_VERSION=<十进制整数>,自检按这个形态读主树那份。
+LEDGER_PUSH_VERSION=1
 
 # 0930 副本自检（0930-数据-10 抓出台账仓 ops/ 副本落后主树，0927-小程序-19 是同件第一次）：主树 ops/ 那份是权威，
 #   随 btd-ledger 分发的本份一旦与主树那份内容不同，就改为执行主树那份（lock 与判据按 cwd 仓库根取，不受影响）；
 #   主树不在（别的机器）则照常用本份。判据用 cmp 比内容，不比 mtime；只重执行一次，防两份互指成环。
+# 1105 补版本门（#1269 r1 阻断项 3）：主树那份也可能比本份旧（主树没 ff 到含新步骤的提交、或在别的机器上落后），
+#   无条件改执行主树那份会把本份已有的步骤丢掉；所以先读主树那份的版本号，比本份小就执行本份并提示，
+#   不小于本份（含同版本内容不同）才照 0930 的规则改执行主树那份。
 BTD_MAIN_LEDGER_PUSH="${BTD_MAIN_LEDGER_PUSH:-$HOME/btd/main/ops/ledger-push.sh}"
 if [[ -z "${BTD_LEDGER_PUSH_NO_REEXEC:-}" && -f "$BTD_MAIN_LEDGER_PUSH" ]] && ! cmp -s "$BTD_MAIN_LEDGER_PUSH" "${BASH_SOURCE[0]}"; then
-  echo "notice: 本份 ledger-push.sh 与主树 $BTD_MAIN_LEDGER_PUSH 内容不同（台账仓 ops/ 副本落后或超前），改为执行主树那份；请主R 同步副本" >&2
-  BTD_LEDGER_PUSH_NO_REEXEC=1 exec bash "$BTD_MAIN_LEDGER_PUSH" "$@"
+  MAIN_PUSH_VERSION="$(sed -n 's/^LEDGER_PUSH_VERSION=\([0-9][0-9]*\)$/\1/p' "$BTD_MAIN_LEDGER_PUSH" | head -1)"
+  if [[ "$((10#${MAIN_PUSH_VERSION:-0}))" -lt "$LEDGER_PUSH_VERSION" ]]; then
+    echo "notice: 主树 ${BTD_MAIN_LEDGER_PUSH} 那份比本份旧（版本 ${MAIN_PUSH_VERSION:-0}<${LEDGER_PUSH_VERSION}，缺本份已有的步骤），执行本份；请主R 把主树 ff 到含新版的提交" >&2
+  else
+    echo "notice: 本份 ledger-push.sh 与主树 $BTD_MAIN_LEDGER_PUSH 内容不同（台账仓 ops/ 副本落后，或同版本但内容不同），改为执行主树那份；请主R 同步副本" >&2
+    BTD_LEDGER_PUSH_NO_REEXEC=1 exec bash "$BTD_MAIN_LEDGER_PUSH" "$@"
+  fi
 fi
 
 die() {
@@ -353,5 +365,31 @@ if ! git merge-base --is-ancestor HEAD origin/main; then
   echo "push 未并入"
   exit 2
 fi
+
+# ---------- f. 对象库整理(1105-巡检-09:磁盘每小时少 1.5G,查到是各组台账 clone 的松散对象) ----------
+# 台账文件 14M,每笔提交(本组 commit、别组 pull 带回)都落一个约 6.6M 的松散 blob,不做差分;
+# 13 份 clone 一小时合计写 1.5G(2026-11-05 03:xx 实测 60 分钟 1487M/753 个)。git 自带的 gc --auto
+# 按单个扇出目录估算松散对象数,6.6M 的 blob 要攒到约 1.7G 才会触发,所以这里按松散对象总大小判:
+# 超 LEDGER_LOOSE_AT_KIB(默认 204800=200M)就 repack -a -d 成一个带差分的 pack(主R clone 实测
+# 1730M→339M,首次 13 秒,之后 1 秒),再 prune 掉一天前就已不可达的松散对象(c 步 stash 落的那份
+# blob 在 drop 后不可达)。只在推送成功后做,失败只提示;LEDGER_LOOSE_AT_KIB=0 关闭。
+ledger_housekeeping() {
+  local at="${LEDGER_LOOSE_AT_KIB:-204800}" loose_kib
+  if ! [[ "$at" =~ ^[0-9]+$ ]]; then
+    note "LEDGER_LOOSE_AT_KIB 不是非负整数($at),跳过对象库整理"
+    return 0
+  fi
+  at=$((10#$at))   # 前导零按十进制读(08 不是八进制;#1269 r1 非阻断项 1),否则 bash 算术报错、下一行判假而静默跳过
+  [[ "$at" -gt 0 ]] || return 0
+  loose_kib="$(git count-objects -v 2>/dev/null | awk '/^size:/{print $2}')"
+  [[ "${loose_kib:-0}" -gt "$at" ]] || return 0
+  note "松散对象 $((loose_kib / 1024))M 超过 $((at / 1024))M,整理对象库(首次约十几秒)"
+  if git repack -a -d -q && git prune --expire=1.day.ago; then
+    note "对象库整理完成,松散对象剩 $(( $(git count-objects -v | awk '/^size:/{print $2}') / 1024 ))M"
+  else
+    note "对象库整理失败(本次推送已并入,不受影响)"
+  fi
+}
+ledger_housekeeping
 
 echo "推送成功,已并入 main。"

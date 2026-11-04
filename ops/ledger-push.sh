@@ -28,9 +28,16 @@ LEDGER_PUSH_VERSION=1
 # 1105 补版本门（#1269 r1 阻断项 3）：主树那份也可能比本份旧（主树没 ff 到含新步骤的提交、或在别的机器上落后），
 #   无条件改执行主树那份会把本份已有的步骤丢掉；所以先读主树那份的版本号，比本份小就执行本份并提示，
 #   不小于本份（含同版本内容不同）才照 0930 的规则改执行主树那份。
+#   主树那份存在但不可读（权限）时 sed 会报错，set -e 下整次推送跟着退出（#1269 r2 非阻断项 1）：明确按版本 0 处理、
+#   提示后执行本份，不去 exec 一份读不了的脚本。
 BTD_MAIN_LEDGER_PUSH="${BTD_MAIN_LEDGER_PUSH:-$HOME/btd/main/ops/ledger-push.sh}"
 if [[ -z "${BTD_LEDGER_PUSH_NO_REEXEC:-}" && -f "$BTD_MAIN_LEDGER_PUSH" ]] && ! cmp -s "$BTD_MAIN_LEDGER_PUSH" "${BASH_SOURCE[0]}"; then
-  MAIN_PUSH_VERSION="$(sed -n 's/^LEDGER_PUSH_VERSION=\([0-9][0-9]*\)$/\1/p' "$BTD_MAIN_LEDGER_PUSH" | head -1)"
+  if [[ -r "$BTD_MAIN_LEDGER_PUSH" ]]; then
+    MAIN_PUSH_VERSION="$(sed -n 's/^LEDGER_PUSH_VERSION=\([0-9][0-9]*\)$/\1/p' "$BTD_MAIN_LEDGER_PUSH" | head -1)"
+  else
+    MAIN_PUSH_VERSION=""
+    echo "notice: 主树 ${BTD_MAIN_LEDGER_PUSH} 那份存在但不可读（权限），版本按 0 处理；请主R 查该文件权限" >&2
+  fi
   if [[ "$((10#${MAIN_PUSH_VERSION:-0}))" -lt "$LEDGER_PUSH_VERSION" ]]; then
     echo "notice: 主树 ${BTD_MAIN_LEDGER_PUSH} 那份比本份旧（版本 ${MAIN_PUSH_VERSION:-0}<${LEDGER_PUSH_VERSION}，缺本份已有的步骤），执行本份；请主R 把主树 ff 到含新版的提交" >&2
   else
